@@ -5,6 +5,8 @@ module Main where
 
 import Control.Monad
 import Control.Monad.IO.Class
+import Control.Applicative
+import Data.Traversable
 
 import GHC.Generics
 
@@ -22,6 +24,7 @@ import Data.Aeson.Types
 
 import Database.Redis
 import Snap
+import Snap.Util.FileServe
 
 import Lib
 
@@ -38,45 +41,65 @@ instance ToJSON UUID where
 
 
 data ChatMessage =
-    ChatMessage { id :: UUID, timestamp :: UTCTime, content :: String }
+    ChatMessage { uuid :: UUID, timestamp :: UTCTime, user :: String, content :: String }
     deriving (Read, Show, Eq, Generic)
 
 
-newMessage :: String -> IO ChatMessage
-newMessage content = ChatMessage <$> randomIO <*> getCurrentTime <*> return content
+mkMessage :: String -> String -> IO ChatMessage
+mkMessage user content = ChatMessage <$> randomIO <*> getCurrentTime <*> return user <*> return content
 
 
 instance FromJSON ChatMessage
 instance ToJSON ChatMessage
 
 
-response500 :: Snap ()
-response500 = modifyResponse $ setResponseCode 500
+response :: Int -> Snap ()
+response code = do
+    modifyResponse $ setResponseCode code
+    r <- getResponse
+    finishWith r
 
 
 postMessage :: Connection -> Snap ()
 postMessage conn = do
     Just boardId <- getParam "boardId"
-    response <- liftIO $ runRedis conn $ lpush (BSC8.append "messages:" boardId) []
+    message <- liftIO $ mkMessage "user" "content"
+    result <- liftIO $ runRedis conn $ multiExec $ do
+        lpush (BSC8.append "messages:" boardId) [Data.UUID.toASCIIBytes $ uuid message]
+        set (BSC8.append "message:" $ Data.UUID.toASCIIBytes $ uuid message) $ BSC8.pack $ show message
 
-    case response of (Right _) -> modifyResponse $ setResponseCode 201
-                     (Left errorMessage) -> response500
+    case result of
+        (TxSuccess _) -> response 201
+        TxAborted -> response 500
+        TxError errorMsg -> response 500
 
 
 getMessages :: Connection -> Snap ()
 getMessages conn = do
     Just boardId <- getParam "boardId"
-    response <- liftIO $ runRedis conn $ lrange (BSC8.append "messages:" boardId) 0 (-1)
+    result <- liftIO $ runRedis conn $ multiExec $ lrange (BSC8.append "messages:" boardId) 0 (-1)
 
-    case response of (Right messages) -> writeBS "[]"
-                     (Left errorMessage) -> response500
+    case result of
+        (TxSuccess messageIds) -> do
+            let queries = fmap (\uuid->get $ BSC8.append "message:" uuid) messageIds
+            messages <- liftIO $ runRedis conn $ multiExec $ Data.Traversable.sequence queries
+            writeBS $ BSC8.pack $ show messages
+
+        TxAborted -> response 500
+        TxError errorMsg -> response 500
+
+
+top :: Snap ()
+top = writeBS "top"
 
 
 root :: Connection -> Snap ()
 root conn =
+    ifTop top <|>
     route [ ("messages/:boardId", method POST $ postMessage conn)
           , ("messages/:boardId", method GET $ getMessages conn)
-          ] 
+          , ("static", serveDirectory "static")
+          ]
 
 
 main :: IO ()

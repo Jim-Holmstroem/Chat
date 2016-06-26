@@ -115,7 +115,9 @@ getMessages conn = do
 
 
 instance ToMarkup ChatMessage where
-    toMarkup (ChatMessage uuid timestamp user content) = H.h3 $ H.toHtml $ decodeUtf8 user `Data.Text.append` decodeUtf8 content
+    toMarkup (ChatMessage uuid timestamp user content) = do
+        H.b $ H.toHtml $ decodeUtf8 user `Data.Text.append` ": "
+        H.toHtml $ decodeUtf8 content
 
 
 board :: Connection -> Snap ()
@@ -124,7 +126,22 @@ board conn = do
 
     messages <- liftIO $ f conn  boardId
 
-    writeLazyText $ renderHtml $ H.html $ H.ul $ mapM_ (H.li . toMarkup) messages
+    writeLazyText $ renderHtml $ H.html $ do
+        H.head $ do
+            H.meta H.! A.httpEquiv "cache-control" H.! A.content "max-age=0"
+            H.meta H.! A.httpEquiv "cache-control" H.! A.content "no-cache"
+            H.meta H.! A.httpEquiv "expires" H.! A.content "0"
+            H.meta H.! A.httpEquiv "expires" H.! A.content "Tue, 01 Jan 1980 1:00:00 GMT"
+            H.meta H.! A.httpEquiv "pragma" H.! A.content "no-cache"
+        H.body $ do
+            H.form H.! A.action (H.stringValue $ "/messages/" ++ BSC8.unpack boardId) H.! A.method "post" $ do
+               H.toHtml ("User:" :: Data.Text.Text)
+               H.input H.! A.type_ "text" H.! A.name "user"
+               H.toHtml ("Content:" :: Data.Text.Text)
+               H.input H.! A.type_ "text" H.! A.name "content"
+               H.input H.! A.type_ "submit" H.! A.value "Submit"
+
+            H.ul $ mapM_ (H.li . toMarkup) messages
 
 
 top :: Snap ()

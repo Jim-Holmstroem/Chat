@@ -7,6 +7,8 @@ import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Applicative
 import           Data.Traversable
+import           Data.Maybe
+import           Data.Either
 
 import           GHC.Generics
 
@@ -20,10 +22,10 @@ import           Data.UUID
 import           Data.Time.Clock
 import           Data.Time.ISO8601
 
-import           Data.Aeson
+import           Data.Aeson as JSON
 import           Data.Aeson.Types
 
-import           Database.Redis
+import           Database.Redis hiding (decode)
 import           Snap
 import           Snap.Util.FileServe
 
@@ -34,12 +36,12 @@ import           Lib
 
 
 instance FromJSON UUID where
-    parseJSON value@(Data.Aeson.String content) = case Data.UUID.fromText content of
+    parseJSON value@(JSON.String content) = case Data.UUID.fromText content of
         (Just uuid) -> return uuid
         Nothing -> typeMismatch "UUID" value
     parseJSON invalid = typeMismatch "UUID" invalid
 instance ToJSON UUID where
-    toJSON uuid = Data.Aeson.String $ Data.UUID.toText uuid
+    toJSON uuid = JSON.String $ Data.UUID.toText uuid
 
 
 data ChatMessage = ChatMessage { uuid      :: UUID
@@ -59,11 +61,10 @@ instance ToJSON ChatMessage
 
 
 instance FromJSON BSC8.ByteString where
-    parseJSON value@(Data.Aeson.String content) = return $ encodeUtf8 content
+    parseJSON value@(JSON.String content) = return $ encodeUtf8 content
     parseJSON invalid = typeMismatch "ByteString" invalid
 instance ToJSON BSC8.ByteString where
-    toJSON = Data.Aeson.String . decodeUtf8
-
+    toJSON = JSON.String . decodeUtf8
 
 response :: Int -> Snap ()
 response code = do
@@ -89,15 +90,19 @@ postMessage conn = do
         TxError errorMsg -> response 500
 
 
+decodeChatMessage :: BSC8.ByteString -> Maybe ChatMessage
+decodeChatMessage = decodeStrict
+
+
 getMessages :: Connection -> Snap ()
 getMessages conn = do
     Just boardId <- getParam "boardId"
     Right messageIds <- liftIO $ runRedis conn $ lrange (BSC8.append "messages:" boardId) 0 (-1)
-    messages <- liftIO $ runRedis conn $ getMessagFromIds messageIds
+    messages <- liftIO $ runRedis conn $ getMessagesFromIds messageIds
 
-    mapM_ (writeBS . BSC8.pack . (++ "\n") . show) messages
-        where getMessagFromIds (id:ids) = (:) <$> get (BSC8.append "message:" id)  <*> getMessagFromIds ids
-              getMessagFromIds [] = pure []
+    writeLBS $ encode $ catMaybes $ map decodeChatMessage $ catMaybes $ rights messages
+        where getMessagesFromIds (id:ids) = (:) <$> get (BSC8.append "message:" id) <*> getMessagesFromIds ids
+              getMessagesFromIds [] = pure []
 
 
 --    case result of

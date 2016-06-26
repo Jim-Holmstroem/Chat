@@ -16,6 +16,8 @@ import           System.Random
 
 import qualified Data.ByteString.Char8 as BSC8
 import qualified Data.ByteString.Lazy.Char8 as BSLC8
+
+import qualified Data.Text
 import           Data.Text.Encoding (encodeUtf8, decodeUtf8)
 
 import           Data.UUID
@@ -25,14 +27,17 @@ import           Data.Time.ISO8601
 import           Data.Aeson as JSON
 import           Data.Aeson.Types
 
+import           Text.Blaze
+import qualified Text.Blaze.Html5 as H
+import qualified Text.Blaze.Html5.Attributes as A
+import           Text.Blaze.Html.Renderer.Text
+
 import           Database.Redis hiding (decode)
+
 import           Snap
 import           Snap.Util.FileServe
 
 import           Lib
-
-
--- formatISO8601
 
 
 instance FromJSON UUID where
@@ -42,6 +47,13 @@ instance FromJSON UUID where
     parseJSON invalid = typeMismatch "UUID" invalid
 instance ToJSON UUID where
     toJSON uuid = JSON.String $ Data.UUID.toText uuid
+
+
+instance FromJSON BSC8.ByteString where
+    parseJSON value@(JSON.String content) = return $ encodeUtf8 content
+    parseJSON invalid = typeMismatch "ByteString" invalid
+instance ToJSON BSC8.ByteString where
+    toJSON = JSON.String . decodeUtf8
 
 
 data ChatMessage = ChatMessage { uuid      :: UUID
@@ -59,12 +71,6 @@ mkMessage user content = ChatMessage <$> randomIO <*> getCurrentTime <*> return 
 instance FromJSON ChatMessage
 instance ToJSON ChatMessage
 
-
-instance FromJSON BSC8.ByteString where
-    parseJSON value@(JSON.String content) = return $ encodeUtf8 content
-    parseJSON invalid = typeMismatch "ByteString" invalid
-instance ToJSON BSC8.ByteString where
-    toJSON = JSON.String . decodeUtf8
 
 response :: Int -> Snap ()
 response code = do
@@ -90,28 +96,35 @@ postMessage conn = do
         TxError errorMsg -> response 500
 
 
-decodeChatMessage :: BSC8.ByteString -> Maybe ChatMessage
-decodeChatMessage = decodeStrict
+f :: Connection -> BSC8.ByteString -> IO [ChatMessage]
+f conn boardId = do
+    Right messageIds <- liftIO $ runRedis conn $ lrange (BSC8.append "messages:" boardId) 0 (-1)
+    readMessages <- liftIO $ runRedis conn $ getMessagesFromIds messageIds
+    return $ catMaybes $ map decodeStrict $ catMaybes $ rights readMessages
+        where getMessagesFromIds (id:ids) = (:) <$> get (BSC8.append "message:" id) <*> getMessagesFromIds ids
+              getMessagesFromIds [] = pure []
 
 
 getMessages :: Connection -> Snap ()
 getMessages conn = do
     Just boardId <- getParam "boardId"
-    Right messageIds <- liftIO $ runRedis conn $ lrange (BSC8.append "messages:" boardId) 0 (-1)
-    messages <- liftIO $ runRedis conn $ getMessagesFromIds messageIds
 
-    writeLBS $ encode $ catMaybes $ map decodeChatMessage $ catMaybes $ rights messages
-        where getMessagesFromIds (id:ids) = (:) <$> get (BSC8.append "message:" id) <*> getMessagesFromIds ids
-              getMessagesFromIds [] = pure []
+    messages <- liftIO $ f conn boardId
+
+    writeLBS $ encode $ messages
 
 
---    case result of
---        (Right messages) -> return ()
---    case result of
---        (TxSuccess messageIds) -> do
---            let queries = fmap (\uuid->get $ BSC8.append "message:" uuid) messageIds
---            messages <- liftIO $ runRedis conn $ multiExec $ Data.Traversable.sequence queries
---            writeBS $ BSC8.pack $ show messages
+instance ToMarkup ChatMessage where
+    toMarkup (ChatMessage uuid timestamp user content) = H.h3 $ H.toHtml $ decodeUtf8 user `Data.Text.append` decodeUtf8 content
+
+
+board :: Connection -> Snap ()
+board conn = do
+    Just boardId <- getParam "boardId"
+
+    messages <- liftIO $ f conn  boardId
+
+    writeLazyText $ renderHtml $ H.html $ H.ul $ mapM_ (H.li . toMarkup) messages
 
 
 top :: Snap ()
@@ -123,6 +136,7 @@ root conn =
     ifTop top <|>
     route [ ("messages/:boardId", method POST $ postMessage conn)
           , ("messages/:boardId", method GET $ getMessages conn)
+          , ("boards/:boardId", method GET $ board conn)
           , ("static", serveDirectory "static")
           ]
 
